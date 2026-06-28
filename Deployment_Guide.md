@@ -47,8 +47,71 @@ substitution). The Spring XML configs read environment values through JVM
 | `PUBLIC_DOMAIN` | `ccms.yourdomain.com` | nginx | Public hostname (SSL cert) |
 | `LETSENCRYPT_LIVE_DIR` | `/etc/letsencrypt/live/ccms.yourdomain.com` | nginx | Let's Encrypt cert path |
 | `SERVER_LOG_DIR` | `/home/CCMS/roadmap/logs` | SERVER, log4j2 | SERVER log directory |
+| `SEED_DATA` | `true` | `seed` service, `mysql` | Whether to auto-seed databases on first start |
 
 > Never commit `.env`. Only `.env.example` is tracked.
+
+---
+
+## First-Run Setup (Seed Data)
+
+On a fresh clone, the MySQL and MongoDB containers start empty. The
+`seed` service in `docker-compose.yml` automatically populates them
+from files committed under `db/seeds/`.
+
+### What gets seeded
+
+| Source | Target | Contents |
+|---|---|---|
+| `db/seeds/mongo.archive` | MongoDB `ccms` database | Full snapshot: 21 collections (users, DCUs, events, meter data, scheduler configurations, handshake info, etc.) — 4 MB compressed, ~95 MB uncompressed |
+| `db/seeds/mysql/01-schema.sql` | MySQL `employee_db` | A `ccms_meta` marker table (the app uses MongoDB for all data; see the file's header for context) |
+| `./data/dontdelete/` | `ccms_ui` container `/home/data/dontdelete/` | (Empty by default — drop CSVs in this directory before `docker compose up` if needed) |
+
+### The seed flow
+
+```
+docker compose up -d --build
+   ├── builds 3 images (server, ccms_ui, nginx)  — first run: 5–10 min
+   ├── starts mongodb + mysql (with healthchecks)
+   ├── starts seed container
+   │      ├── waits for mongodb:27017 and mysql:3306
+   │      ├── runs `mongorestore` from /seeds/mongo.archive
+   │      └── applies /seeds/mysql/01-schema.sql
+   ├── on seed exit 0:
+   │      ├── starts server  (waits for mongodb + seed)
+   │      └── starts ccms_ui (waits for mongodb + mysql + server + seed)
+   └── starts nginx
+```
+
+The `seed` container has `restart: "no"`, so it runs once on first
+start and exits. Subsequent `docker compose up` runs skip the seed
+(but the data volumes persist).
+
+### Disabling seeding
+
+Set `SEED_DATA=false` in `.env`. The `seed` container will exit 0
+without touching the databases — useful when you want to start with
+an empty MongoDB or restore from your own backup.
+
+### Re-seeding from scratch
+
+To wipe the volumes and re-run the seed:
+
+```bash
+docker compose down -v         # removes all named + anonymous volumes (mongodb, mysql data)
+docker compose up -d --build   # seed runs again because volumes are now empty
+```
+
+### Regenerating the seed archive (maintainers only)
+
+If you change the live data and want to update the committed seed:
+
+```bash
+docker exec cspl-mongodb \
+    mongodump --db ccms --archive --gzip > db/seeds/mongo.archive
+git add db/seeds/mongo.archive
+git commit -m "Update MongoDB seed snapshot"
+```
 
 ---
 
@@ -680,6 +743,9 @@ This hits 39 endpoints across the CCMS_UI and SERVER REST APIs. **Expected resul
 
 | Problem | Likely Cause | Fix |
 |---|---|---|
+| `seed` container exits with code 1 | MongoDB or MySQL not reachable from seed container, or `mongo.archive` is corrupt | Check `docker compose logs seed`; verify `db/seeds/mongo.archive` exists and is a valid gzip; verify `MONGO_HOST` and `MYSQL_HOST` in `.env` match the compose service names |
+| App starts but MongoDB is empty | `SEED_DATA=false` or seed container was skipped | Set `SEED_DATA=true` and `docker compose up -d --build` (or `docker compose up seed` after the rest are up) |
+| App starts but old data is gone after re-seeding | `mongorestore --drop` wiped the existing database | Expected. Re-seed wipes the target db first. Set `SEED_DATA=false` to preserve existing data |
 | `docker compose up` fails with "variable not set" | `.env` missing or incomplete | `cp .env.example .env` and fill in real values |
 | CCMS_UI cannot connect to SERVER | Wrong `ccms.server.host` | Set `CCMS_SERVER_HOST` in `.env` (`localhost` for local, `server` for Docker, or your FQDN) |
 | MySQL connection refused in CCMS_UI | Wrong DB credentials in env | Check `MYSQL_ROOT_PASSWORD` and `MYSQL_DATABASE` in `.env` |
@@ -718,3 +784,6 @@ This hits 39 endpoints across the CCMS_UI and SERVER REST APIs. **Expected resul
 | `scripts/api-smoke-test.sh` | Live HTTP smoke test against 39 endpoints — requires running deployment |
 | `scripts/backup.sh` | Backs up MongoDB, MySQL, and historical CSV data; reads `.env` |
 | `scripts/restore.sh` | Restores from a backup directory; reads `.env` |
+| `db/seeds/mongo.archive` | Committed MongoDB `ccms` snapshot used by the `seed` service |
+| `db/seeds/mysql/01-schema.sql` | MySQL schema applied by the MySQL image on first start + by the `seed` service |
+| `db/seeds/seed.sh` | Orchestrator: waits for DBs, then restores from the archive + applies the schema |

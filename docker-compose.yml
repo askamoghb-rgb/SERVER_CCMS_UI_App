@@ -6,6 +6,11 @@ services:
       - "27017:27017"
     volumes:
       - ./data/mongodb:/data/db
+    healthcheck:
+      test: ["CMD", "mongo", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
     restart: unless-stopped
 
   mysql:
@@ -20,7 +25,36 @@ services:
       MYSQL_DATABASE: ${MYSQL_DATABASE}
     volumes:
       - ./data/mysql:/var/lib/mysql
+      - ./db/seeds/mysql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
     restart: unless-stopped
+
+  seed:
+    build:
+      context: ./db/seeds
+    container_name: cspl-seed
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./db/seeds:/seeds:ro
+    env_file:
+      - .env
+    environment:
+      MONGO_HOST: ${MONGODB_HOST}
+      MONGO_PORT: ${MONGODB_PORT}
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      SEED_DATA: ${SEED_DATA:-true}
+    restart: "no"
 
   server:
     build:
@@ -39,7 +73,10 @@ services:
       SPRING_DATA_MONGODB_PASSWORD: ${MONGODB_PASSWORD}
       SERVER_LOG_DIR: ${SERVER_LOG_DIR}
     depends_on:
-      - mongodb
+      mongodb:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   ccms_ui:
@@ -55,9 +92,14 @@ services:
     environment:
       CATALINA_OPTS: "-Dccms.server.host=${CCMS_SERVER_HOST} -Dmongodb.host=${MONGODB_HOST} -Dmongodb.port=${MONGODB_PORT} -Dmongodb.database=${MONGODB_DATABASE} -Dmysql.database=${MYSQL_DATABASE} -Dmysql.username=root -Dmysql.password=${MYSQL_ROOT_PASSWORD} -Dserver.port=${SERVER_PORT} -Dbackend.http.port=${SERVER_PORT} -Dbackend.http.context=${SERVER_CONTEXT_PATH}"
     depends_on:
-      - mongodb
-      - mysql
-      - server
+      mongodb:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      server:
+        condition: service_started
+      seed:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   nginx:
